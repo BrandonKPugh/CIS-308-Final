@@ -1,0 +1,358 @@
+//
+// Library created by dxing97 on 11/11/17.
+// Modified by Brandon Pugh on 12/2/18.
+//
+
+#include "libdiscord.h"
+#include "framework.c"
+
+#include <getopt.h>
+#include <signal.h>
+#include <REST.h>
+
+static int bot_exit = 0; //0: no exit, 1: exit
+static int bot_state = 0; //0: not connected/disconnected, 1: connect initiated
+static int fail_mode = 0; //0: default, try recovering, 1: exit on error
+CURL *handle;
+//int use_ulfius = 0;
+char *trigger = "ping", *response = "pong";
+void int_handler(int i){
+    bot_exit = 1;
+}
+
+/*
+ * main way of user interaction with libdiscord
+ * the user callback returns 0 if everything is OK
+ *
+ * ld_context contains info about the bot. The user shouldn't have to mess with it.
+ * ld_callback_reason is the reason for the library calling the callback. See the enum declaration in libdiscord.h
+ * data and len contain data that may be needed for the callback, their use depends on the reason for the callback.
+ */
+int callback(struct ld_context *context, enum ld_callback_reason reason, void *data, int len) {
+    /*
+     * depending on the reason, do stuff
+     */
+    //if the reason is a gateway event, and the payload is a dispatch, and the dispatch contains a message JSON, and the message has content "ayy" (case statement?)
+        //post a "lmao" to the channel
+        //create a new message info struct with content "lmao"
+        //add that context to the send queue
+    CURLcode res;
+    const char *key, *content, *channelid;
+    int respondstat = 0, ret = 0;
+
+    switch(reason){
+        case LD_CALLBACK_MESSAGE_CREATE: {
+            json_t *jdata = data, *value;
+
+            //if content == "ayy", POST "lmao" to that channel
+            ld_debug("received MESSAGE_CREATE dispatch");
+
+            //we want the "content" and "channel id" fields
+            json_object_foreach(jdata, key, value) {
+                if (strcmp(key, "content") == 0) {
+                    content = json_string_value(value);
+                    if (content == NULL) {
+                        ld_warning("couldn't get message content");
+                        break;
+                    }
+					/* Original compare statement
+                    if(strcasecmp(content, trigger) == 0 ) {
+                            respondstat++;
+                    }
+			*/
+			// If 1 is returned then the bot will respond
+			
+			messageResponse * output;
+			output = frameworkMessageReceived(content);
+			if(output->respond == 1) {
+				respondstat++;
+				response = output->response;
+			}
+			
+			/*
+			char * check = "test";
+			if(strcasecmp(content, check) == 0)
+			{
+				respondstat++;
+				char * temp = "response";
+				response = temp;
+			}
+			*/
+                }
+
+                if (strcmp(key, "channel_id") == 0) {
+                    channelid = json_string_value(value);
+                    if (channelid == NULL) {
+                        ld_warning("couldn't get channel_id");
+                        break;
+                    }
+                    respondstat++;
+                }
+            }
+        }
+            break;
+        default:
+            break;
+    }
+
+    ld_debug("respondstat = %d", respondstat);
+
+    if(respondstat != 2) { //did not get channel ID and correct content
+        return 0;
+    }
+    //generate POST message
+    json_t *body;
+    body = json_pack("{ss}", "content", response);
+    if(body == NULL) {
+        ld_error("couldn't create JSON object for response data");
+        return 0;
+    }
+    char *tmp;
+    tmp = json_dumps(body, 0);
+    if(tmp == NULL) {
+        ld_error("couldn't dump JSON string for response data");
+        return 0;
+    }
+    char *jsonbody = strdup(tmp);
+    ld_debug("body to post: %s", jsonbody);
+
+//    if(use_ulfius) {
+//        struct ld_rest_request *request;
+//        struct ld_rest_response *resp;
+//        request = ld_rest_init_request();
+//        resp = ld_rest_init_response();
+//
+//        ld_create_message(request, context, channelid, response);
+//        ld_rest_send_request(request, resp);
+//    } else {
+        //curl POST to that channel
+        struct curl_slist *headers = NULL;
+        char auth_header[1000];
+        sprintf(auth_header, "Authorization: Bot %s ", context->bot_token);
+        headers = curl_slist_append(headers, auth_header);
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+
+
+        char url[1000];
+        sprintf(url, "%s/%s/messages", LD_API_URL LD_REST_API_VERSION "/channels", channelid);
+
+        curl_easy_setopt(handle, CURLOPT_URL, url);
+        curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(handle, CURLOPT_USERAGENT, "DiscordBot (https://github.com/dxing97/libdiscord 0.3)");
+        curl_easy_setopt(handle, CURLOPT_POSTFIELDS, jsonbody);
+        curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long) strlen(jsonbody));
+        curl_easy_setopt(handle, CURLOPT_VERBOSE, 1);
+        ret = curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, 1L);
+        if(ret != CURLE_OK) {
+            ld_debug("TCP keepalive unavailable");
+        }
+        ret = curl_easy_setopt(handle, CURLOPT_TCP_KEEPIDLE, 120L);
+        if(ret != CURLE_OK) {
+            ld_debug("TCP keepalive idle unavailable");
+        }
+        ret = curl_easy_setopt(handle, CURLOPT_TCP_KEEPINTVL, 60L);
+        if(ret != CURLE_OK) {
+            ld_debug("TCP keepalive interval unavailable");
+        }
+
+        res = curl_easy_perform(handle);
+        if(res != CURLE_OK) {
+            ld_error("couldn't POST lmao");
+            return 0;
+        }
+
+
+        curl_slist_free_all(headers);
+//    }
+
+    free(jsonbody);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+
+    /*
+     * pass in arguments for parameters that we want to connect to discord with.
+     *  this includes the bot token, debug verbosity, and so on
+     *  use getopt
+     * initialize a connection to the gateway
+     *
+     * listen for messages sent with "args" (with permutations)
+     * if any "args" are detected, POST a message to the same channel with the response
+     * continue ad infinitum (or until the bot is killed)
+     */
+    int c; //bot_exit: 0 for don't exit, 1 for exit
+    char *bot_token = NULL;
+    char *game = NULL;
+    unsigned long log_level = 31;
+    if(argc == 1) {
+        goto HELP;
+    }
+
+    while(1) {
+        //options: help, bot token
+        //if bot token isn't specified, exit
+        static struct option long_options[] = {
+                {"bot-token", required_argument, 0, 't'},
+                {"help", no_argument, 0, 'h'},
+                {"log-level", required_argument, 0, 'l'},
+//                {"use-ulfius", no_argument, 0, 'u'},
+                {"game", required_argument, 0, 'g'},
+                {"trigger", required_argument, 0, 'r'},
+                {"response", required_argument, 0, 'R'},
+                {"abort-on-error", no_argument, 0, 'a'},
+                {0,0,0,0}
+        };
+
+        int option_index = 0;
+        c = getopt_long(argc, argv, "ht:l:"
+//                                    "u"
+                                    "g:r:R:a", long_options, &option_index);
+
+        if(c == -1){
+            break;
+        }
+
+        switch(c) {
+            case 'h':
+            HELP:
+                printf("C Final bot: basic command bot for class presentation\n"
+                               "%s [-t bot_token]\n\n"
+                               "Options: \n\t"
+                               "-t, --bot-token [bot_token]\n\t\t"
+                               "Required. Discord bot token. See Discord developer pages on how to obtain one.\n\t"
+//                               "-u, --use-ulfius\n\t\t"
+//                               "If set, uses ulfius to send messages instead of libcurl. \n\t\t"
+//                               "Default is to use libcurl\n\t"
+                               "-g, --game\n\t\t"
+                               "Sets the initial value of the \"game\" field in the bot presence.\n\t"
+                               "-r, --trigger [trigger_string]\n\t\t"
+                               "Sets string that will trigger a response from the bot.\n\t"
+                               "-R, --response [response_string]\n\t\t"
+                               "Sets response that will be sent when the trigger is read.\n\t"
+                               "-a --abort-on-error \n\t\t"
+                               "If set, the bot will exit if the websocket connection is closed instead of trying to reconnect.\n\t"
+                               "-h, --help\n\t\t"
+                               "Displays this help dialog\n", argv[0]);
+                return 0;
+            case 't':
+                bot_token = strdup(optarg);
+                break;
+            case 'l':
+                log_level = strtoul(optarg, NULL, 10);
+                break;
+//            case 'u':
+//                use_ulfius = 1;
+//                break;
+            case 'g':
+                game = strdup(optarg);
+                break;
+            case 'r':
+                trigger = strdup(optarg);
+                break;
+            case 'R':
+                response = strdup(optarg);
+                break;
+            case 'a':
+                fail_mode = 1;
+            default:
+                abort();
+        }
+    }
+
+    printf("C Bot starting up using libdiscord v%s\n", LD_VERSION);
+
+    if(bot_token == NULL){
+        printf("Bot token not set! Use -h for details.");
+        return 1;
+    }
+    printf("Initializing libdiscord with log level %lu\n", log_level);
+
+    ld_set_logging_level(log_level);
+
+    signal(SIGINT, int_handler);
+    ld_debug("set response to %s", response);
+    //define context info, including bot token
+    struct ld_context_info *info;
+    info = malloc(sizeof(struct ld_context_info));
+
+    printf("Context info defined\n");
+
+    struct _ld_json_presence *presence;
+    presence = malloc(sizeof(struct _ld_json_presence));
+    presence->status_type = LD_PRESENCE_DND;
+    presence->game_type = LD_PRESENCE_STREAMING;
+    if(game != NULL) {
+        presence->game = strdup(game);
+    } else {
+        presence->game = strdup("CIS 308 Final");
+    }
+
+    printf("Presence updated\n");
+
+    info->init_presence = presence;
+    info->bot_token = strdup(bot_token);
+//    info->log_level = log_level;
+    info->user_callback = callback;
+    info->gateway_ringbuffer_size = 8;
+
+    printf("Info completed\n");
+
+    free(bot_token);
+
+    //initialize context with context info
+    struct ld_context context;
+    void *retp;
+    retp = ld_init_context(&context, info); //garbage in, garbage out
+    if(retp == NULL) {
+        ld_error("error creating libdiscord context");
+        return 1;
+    }
+
+    printf("libdiscord context created\n");
+
+    free(presence->game);
+    presence->game = NULL;
+    free(game);
+    game = NULL;
+    free(info);
+    free(presence);
+
+    handle = curl_easy_init();
+
+    printf("bot setup complete\n");
+
+    int ret, i = 0; 
+    //while the bot is still alive
+    while(!bot_exit) {
+        if(bot_state == 0) {
+            //bot isn't connected, so we should try connecting
+            printf("Bot isn\'t connected, attemping to connect\n");
+            ret = ld_connect(&context);
+            printf("Attempted to connect\n");
+            if(ret != 0) {
+                printf("Failed to connect\n");
+                ld_warning("error connecting to discord: error code %d", ret);
+                break;
+            }
+            printf("Bot has connected!\n");
+            bot_state = 1;
+        }
+
+        ret = ld_service(&context, 20); //service the connection
+        if(ret != 0) {
+            ld_error("ld_service returned non-0 (%d)", ret);
+            if(fail_mode == 1)
+                bot_exit = 0;
+            else
+                bot_exit = 1;
+        }
+    }
+    //disconnect from discord gracefully
+    ld_info("disconnecting from discord");
+    //destroy the context
+    ld_destroy_context(&context);
+    curl_easy_cleanup(handle);
+    return 0;
+}
